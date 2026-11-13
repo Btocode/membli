@@ -13,6 +13,7 @@ mod daemon;
 mod diagnose;
 mod gui;
 mod store;
+mod update;
 
 fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
@@ -30,13 +31,17 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some("clean") => {
-            for (t, o) in cleanup::auto_run(config::Config::load().trash_days) {
+            for (t, o) in { let c = config::Config::load(); cleanup::auto_run(c.trash_days, c.auto_browser) } {
                 println!("{t}: freed {} {}", collect::human_bytes(o.freed), o.note);
             }
             Ok(())
         }
+        Some("-V") | Some("--version") => {
+            println!("membli {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some("-h") | Some("--help") => {
-            println!("membli [daemon|install|report|clean]");
+            println!("membli [daemon|install|report|clean|--version]");
             Ok(())
         }
         _ => gui::run(),

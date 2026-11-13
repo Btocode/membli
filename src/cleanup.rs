@@ -26,6 +26,8 @@ enum Action {
     /// delete these folders entirely
     RemoveDirs(Vec<PathBuf>),
     Trash,
+    /// delete files inside this folder not used for this many days (folders stay)
+    OldFiles(PathBuf, u64),
     Cmd(Vec<String>),
     Root(String),
 }
@@ -93,6 +95,65 @@ fn clear_dir(p: &Path) -> u64 {
         }
     }
     before.saturating_sub(dir_size(p))
+}
+
+/// Files under `dir` not opened or changed for `days` days. Deletes them unless `dry`.
+fn old_files(dir: &Path, days: u64, dry: bool) -> u64 {
+    if !allowed(dir) {
+        return 0;
+    }
+    let cutoff = SystemTime::now() - Duration::from_secs(days * 86400);
+    let dev = match fs::symlink_metadata(dir) { Ok(m) => m.dev(), Err(_) => return 0 };
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let Ok(m) = fs::symlink_metadata(e.path()) else { continue };
+            if m.file_type().is_symlink() || m.dev() != dev {
+                continue;
+            }
+            if m.is_dir() {
+                stack.push(e.path());
+                continue;
+            }
+            let last = m.accessed().ok().max(m.modified().ok());
+            if last.map(|t| t < cutoff).unwrap_or(false) {
+                total += m.blocks() * 512;
+                if !dry {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+    total
+}
+
+/// A browser that is open, if any (process or its lock file).
+pub fn browser_open() -> Option<String> {
+    if let Some(p) = proc_running(&["chrome", "chromium", "brave", "firefox", "msedge", "firefox-bin"]) {
+        return Some(p);
+    }
+    let h = home();
+    for lock in [".config/google-chrome/SingletonLock", ".config/chromium/SingletonLock", ".config/BraveSoftware/Brave-Browser/SingletonLock"] {
+        if fs::symlink_metadata(h.join(lock)).is_ok() {
+            return Some("the browser".into());
+        }
+    }
+    None
+}
+
+fn browser_cache_dirs() -> Vec<PathBuf> {
+    let h = home();
+    ["google-chrome", "chromium", "BraveSoftware", "mozilla", "microsoft-edge"].iter().map(|b| h.join(".cache").join(b)).filter(|p| p.exists()).collect()
+}
+
+fn sysctl(name: &str) -> String {
+    fs::read_to_string(format!("/proc/sys/{}", name.replace('.', "/"))).unwrap_or_default().trim().to_string()
+}
+
+fn zram_on() -> bool {
+    fs::read_to_string("/proc/swaps").map(|s| s.contains("zram")).unwrap_or(false)
 }
 
 fn proc_running(names: &[&str]) -> Option<String> {
@@ -312,16 +373,16 @@ pub fn scan(trash_days: u64) -> Vec<Rule> {
     let mut v = Vec::new();
     let sized = |paths: &[PathBuf]| paths.iter().map(|p| dir_size(p)).sum::<u64>();
 
-    let thumbs = vec![h.join(".cache/thumbnails")];
+    let thumbs = h.join(".cache/thumbnails");
     v.push(Rule {
         id: "thumbnails",
-        title: "Picture thumbnails".into(),
-        explain: "Small previews the file manager makes. They are rebuilt when needed.".into(),
+        title: "Thumbnails unused for 30 days".into(),
+        explain: "Small previews the file manager made for pictures you haven't looked at in a month. They are rebuilt when needed.".into(),
         risk: Risk::Safe,
-        size: Some(sized(&thumbs)),
+        size: Some(old_files(&thumbs, 30, true)),
         blocked: None,
         items: vec![],
-        action: Action::ClearDirs(thumbs),
+        action: Action::OldFiles(thumbs, 30),
     });
     v.push(Rule {
         id: "trash",
@@ -345,13 +406,9 @@ pub fn scan(trash_days: u64) -> Vec<Rule> {
         action: Action::ClearDirs(pip),
     });
 
-    let browsers: Vec<PathBuf> = ["google-chrome", "chromium", "BraveSoftware", "mozilla", "microsoft-edge"]
-        .iter()
-        .map(|b| h.join(".cache").join(b))
-        .filter(|p| p.exists())
-        .collect();
+    let browsers = browser_cache_dirs();
     if !browsers.is_empty() {
-        let running = proc_running(&["chrome", "chromium", "brave", "firefox", "msedge"]);
+        let running = browser_open();
         v.push(Rule {
             id: "browser",
             title: "Browser caches".into(),
@@ -517,6 +574,59 @@ pub fn scan(trash_days: u64) -> Vec<Rule> {
             action: Action::Root("swapoff -a && swapon -a".into()),
         });
     }
+
+    // ---- tuning (one click, then it stays) ----
+    let tracker = Command::new("gsettings").args(["get", "org.freedesktop.Tracker3.Miner.Files", "throttle"]).output();
+    if let Ok(o) = tracker {
+        let cur: u32 = String::from_utf8_lossy(&o.stdout).split_whitespace().last().and_then(|x| x.parse().ok()).unwrap_or(0);
+        if o.status.success() && cur < 20 {
+            v.push(Rule {
+                id: "tracker",
+                title: "Slow down the file indexer".into(),
+                explain: "GNOME's file indexer (Tracker) reads the whole disk in the background. This makes it yield to everything else. Search still works.".into(),
+                risk: Risk::Ask,
+                size: None,
+                blocked: None,
+                items: vec![],
+                action: Action::Cmd(vec!["gsettings".into(), "set".into(), "org.freedesktop.Tracker3.Miner.Files".into(), "throttle".into(), "20".into()]),
+            });
+        }
+    }
+    let zram = zram_on();
+    if !Path::new("/etc/sysctl.d/90-membli.conf").exists() {
+        let swappiness = if zram { 150 } else { 20 };
+        v.push(Rule {
+            id: "ssd-tune",
+            title: "Tune memory for a slow SSD".into(),
+            explain: format!(
+                "Writes data to disk in small steady batches instead of big bursts that stall the desktop (dirty limits 64 / 256 MB, now {} / {} %), keeps file caches longer, and sets swappiness to {swappiness} (now {}). Saved in /etc/sysctl.d/90-membli.conf; delete that file to undo.",
+                sysctl("vm.dirty_background_ratio"),
+                sysctl("vm.dirty_ratio"),
+                sysctl("vm.swappiness")
+            ),
+            risk: Risk::Admin,
+            size: None,
+            blocked: None,
+            items: vec![],
+            action: Action::Root(format!(
+                "printf 'vm.dirty_background_bytes=67108864\\nvm.dirty_bytes=268435456\\nvm.vfs_cache_pressure=50\\nvm.swappiness={swappiness}\\n' > /etc/sysctl.d/90-membli.conf && sysctl --system >/dev/null && echo tuned"
+            )),
+        });
+    }
+    if !zram {
+        v.push(Rule {
+            id: "zram",
+            title: "Turn on zram (compressed swap in RAM)".into(),
+            explain: "Swaps to a compressed area in RAM instead of the slow disk, so a full swap no longer freezes the PC. Installs zram-tools (half of RAM, zstd); the disk swap stays as a backup.".into(),
+            risk: Risk::Admin,
+            size: None,
+            blocked: proc_running(&["apt", "apt-get", "dpkg", "unattended-upgr"]).map(|_| "Software updates are running".into()),
+            items: vec![],
+            action: Action::Root(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y zram-tools >/dev/null && printf 'ALGO=zstd\\nPERCENT=50\\nPRIORITY=100\\n' > /etc/default/zramswap && systemctl restart zramswap && printf 'vm.swappiness=150\\nvm.page-cluster=0\\n' > /etc/sysctl.d/91-membli-zram.conf && sysctl --system >/dev/null && echo zram on".into(),
+            ),
+        });
+    }
     v
 }
 
@@ -549,6 +659,7 @@ pub fn run(rule: &Rule, trash_days: u64) -> Outcome {
             Outcome { freed, note: format!("{} folders", ps.len()) }
         }
         Action::Trash => Outcome { freed: trash_old(trash_days, false), note: String::new() },
+        Action::OldFiles(dir, days) => Outcome { freed: old_files(dir, *days, false), note: String::new() },
         Action::Cmd(args) => {
             let before = root_free();
             let o = Command::new(&args[0]).args(&args[1..]).output();
@@ -577,9 +688,15 @@ pub fn run(rule: &Rule, trash_days: u64) -> Outcome {
 }
 
 /// Run only the Safe rules. Used by the background service.
-pub fn auto_run(trash_days: u64) -> Vec<(String, Outcome)> {
+pub fn auto_run(trash_days: u64, browser_too: bool) -> Vec<(String, Outcome)> {
     crate::collect::be_gentle();
-    scan_safe(trash_days)
+    let mut rules = scan_safe(trash_days);
+    if browser_too && browser_open().is_none() {
+        let dirs = browser_cache_dirs();
+        let size = dirs.iter().map(|p| dir_size(p)).sum();
+        rules.push(Rule { id: "browser", title: "Browser caches".into(), explain: String::new(), risk: Risk::Ask, size: Some(size), blocked: None, items: vec![], action: Action::ClearDirs(dirs) });
+    }
+    rules
         .into_iter()
         .filter(|r| r.size.unwrap_or(0) > 0)
         .map(|r| (r.title.clone(), run(&r, trash_days)))
@@ -589,10 +706,10 @@ pub fn auto_run(trash_days: u64) -> Vec<(String, Outcome)> {
 fn scan_safe(trash_days: u64) -> Vec<Rule> {
     // cheap subset of scan(): safe rules only
     let h = home();
-    let thumbs = vec![h.join(".cache/thumbnails")];
+    let thumbs = h.join(".cache/thumbnails");
     let pip = vec![h.join(".cache/pip")];
     vec![
-        Rule { id: "thumbnails", title: "Picture thumbnails".into(), explain: String::new(), risk: Risk::Safe, size: Some(thumbs.iter().map(|p| dir_size(p)).sum()), blocked: None, items: vec![], action: Action::ClearDirs(thumbs) },
+        Rule { id: "thumbnails", title: "Old thumbnails".into(), explain: String::new(), risk: Risk::Safe, size: Some(old_files(&thumbs, 30, true)), blocked: None, items: vec![], action: Action::OldFiles(thumbs, 30) },
         Rule { id: "trash", title: "Old trash".into(), explain: String::new(), risk: Risk::Safe, size: Some(trash_old(trash_days, true)), blocked: None, items: vec![], action: Action::Trash },
         Rule { id: "pip", title: "Python package downloads".into(), explain: String::new(), risk: Risk::Safe, size: Some(pip.iter().map(|p| dir_size(p)).sum()), blocked: None, items: vec![], action: Action::ClearDirs(pip) },
     ]

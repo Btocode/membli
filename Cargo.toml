@@ -1,13 +1,13 @@
 [package]
 name = "membli"
-version = "0.1.0"
+version = "0.2.0"
 license = "MIT"
 repository = "https://github.com/Btocode/membli"
 edition = "2021"
 description = "Membli: a sci-fi control center for an Ubuntu PC: live health, freeze detection, history, cleanup, Claude insights"
 
 [dependencies]
-eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland", "default_fonts", "clipboard"] }
 rusqlite = { version = "0.42", features = ["bundled"] }
 ureq = { version = "3", features = ["json"] }
 serde = { version = "1", features = ["derive"] }

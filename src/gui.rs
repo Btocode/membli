@@ -5,7 +5,7 @@ use crate::collect::{human_bytes, Sampler, Snapshot};
 use crate::config::{ClaudeMode, Config};
 use crate::diagnose::{analyze, health_score, Act, Finding, Level};
 use crate::store::{CleanupEntry, Event, Row, Store};
-use crate::{claude, daemon};
+use crate::{claude, daemon, update};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui, Vec2,
 };
@@ -14,7 +14,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><radialGradient id="g" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#0b2a3a"/><stop offset="1" stop-color="#04080e"/></radialGradient></defs><rect width="64" height="64" rx="12" fill="url(#g)"/><polygon points="32,6 54.5,19 54.5,45 32,58 9.5,45 9.5,19" fill="none" stroke="#00e5ff" stroke-width="2.4" stroke-linejoin="round"/><polygon points="32,12 49.3,22 49.3,42 32,52 14.7,42 14.7,22" fill="#00e5ff" fill-opacity="0.07"/><polyline points="20.3,42.4 20.3,22.1 32,35.1 43.7,22.1 43.7,42.4" fill="none" stroke="#00e5ff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20.3" cy="42.4" r="2.6" fill="#00e5ff"/><circle cx="20.3" cy="22.1" r="2.6" fill="#00e5ff"/><circle cx="43.7" cy="22.1" r="2.6" fill="#00e5ff"/><circle cx="43.7" cy="42.4" r="2.6" fill="#00e5ff"/><circle cx="32" cy="35.1" r="4.4" fill="#ff2bd6"/></svg>"##;
 
 
 // palette: deep space with neon readouts
@@ -77,6 +76,9 @@ struct Live {
     now: Arc<Snapshot>,
     /// recent snapshots for charts, process lists stripped to keep frames cheap
     ring: VecDeque<Snapshot>,
+    /// the same history shared with the window, rebuilt once per sample (never per frame)
+    shared_ring: Arc<Vec<Snapshot>>,
+    at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -91,9 +93,15 @@ struct Shared {
     claude_busy: bool,
     claude_reply: Option<Result<String, String>>,
     service_active: Option<bool>,
+    update_checking: bool,
+    /// None = not checked; Some(Ok(None)) = up to date
+    update: Option<Result<Option<(String, String)>, String>>,
 }
 
 pub struct App {
+    /// how often the sampler thread reads the system, in ms
+    sample_ms: Arc<std::sync::atomic::AtomicU64>,
+    smooth_now: bool,
     page: Page,
     live: Arc<Mutex<Live>>,
     shared: Arc<Mutex<Shared>>,
@@ -129,10 +137,13 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         style(&cc.egui_ctx);
+        cc.egui_ctx.add_plugin(CopyOnSelect::default());
         let live = Arc::new(Mutex::new(Live::default()));
+        let sample_ms = Arc::new(std::sync::atomic::AtomicU64::new(1000));
         {
             let live = live.clone();
             let ctx = cc.egui_ctx.clone();
+            let sample_ms = sample_ms.clone();
             std::thread::spawn(move || {
                 let mut s = Sampler::new();
                 s.sample();
@@ -148,9 +159,15 @@ impl App {
                             l.ring.pop_front();
                         }
                         l.now = Arc::new(snap);
+                        l.shared_ring = Arc::new(l.ring.iter().cloned().collect());
+                        l.at = Some(Instant::now());
                     }
                     ctx.request_repaint();
-                    std::thread::sleep(Duration::from_secs(1));
+                    // sleep in small steps so a new interval applies at once
+                    let start = Instant::now();
+                    while start.elapsed() < Duration::from_millis(sample_ms.load(std::sync::atomic::Ordering::Relaxed)) {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                 }
             });
         }
@@ -185,6 +202,8 @@ impl App {
             _ => Page::Overview,
         };
         let mut app = Self {
+            sample_ms,
+            smooth_now: true,
             page,
             live,
             shared,
@@ -216,6 +235,9 @@ impl App {
             freezes_at: None,
         };
         app.start_scan();
+        if app.cfg.check_updates {
+            app.check_updates();
+        }
         if page == Page::Disk {
             app.start_space();
         }
@@ -240,6 +262,23 @@ impl App {
             let mut s = sh.lock().unwrap();
             s.rules = Some(rules);
             s.scanning = false;
+        });
+    }
+
+    fn check_updates(&self) {
+        let sh = self.shared.clone();
+        {
+            let mut s = sh.lock().unwrap();
+            if s.update_checking {
+                return;
+            }
+            s.update_checking = true;
+        }
+        std::thread::spawn(move || {
+            let r = update::check().map(|o| o.map(|r| (r.tag, r.url)));
+            let mut s = sh.lock().unwrap();
+            s.update = Some(r);
+            s.update_checking = false;
         });
     }
 
@@ -401,6 +440,36 @@ impl App {
 
     fn toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
+    }
+}
+
+/// Copies text to the clipboard as soon as you finish selecting it (and Ctrl+C still works).
+#[derive(Default)]
+struct CopyOnSelect;
+
+fn copied_id() -> egui::Id {
+    egui::Id::unique("membli_copied")
+}
+
+impl egui::plugin::Plugin for CopyOnSelect {
+    fn debug_name(&self) -> &'static str {
+        "CopyOnSelect"
+    }
+
+    fn on_end_pass(&mut self, ui: &mut Ui) {
+        let settled = ui.ctx().output(|o| {
+            o.commands.iter().rev().find_map(|c| match c {
+                egui::OutputCommand::TextSelectionSettled(t) => Some(t.clone()),
+                _ => None,
+            })
+        });
+        // egui reports a selection once, when the mouse is released
+        if let Some(t) = settled {
+            if !t.trim().is_empty() {
+                ui.ctx().copy_text(t);
+                ui.ctx().data_mut(|d| d.insert_temp(copied_id(), Instant::now()));
+            }
+        }
     }
 }
 
@@ -577,9 +646,21 @@ fn danger(ui: &mut Ui, text: &str) -> egui::Response {
     hud_button(ui, text, BAD, true)
 }
 
+fn phase_id() -> egui::Id {
+    egui::Id::unique("membli_phase")
+}
+
+/// Ease a number toward its new value so readouts roll instead of jumping.
+fn ease(ui: &Ui, key: &str, target: f32) -> f32 {
+    ui.ctx().animate_value_with_time(egui::Id::unique(("ease", key)), target, 0.45)
+}
+
 /// Segmented level bar.
 fn bar(ui: &mut Ui, frac: f32, color: Color32, width: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 10.0), Sense::hover());
+    // ease per bar position so level changes slide instead of snapping
+    let key = format!("bar{:.0}x{:.0}", rect.left(), rect.top());
+    let frac = ease(ui, &key, frac.clamp(0.0, 1.0));
     let p = ui.painter();
     let n = (width / 7.0) as usize;
     let lit = (frac.clamp(0.0, 1.0) * n as f32).round() as usize;
@@ -616,7 +697,9 @@ fn ring(ui: &mut Ui, score: u8, size: f32) {
     // segmented score ring
     let r2 = size / 2.0 - 24.0;
     let n = 48;
-    let lit = (score as f32 / 100.0 * n as f32).round() as usize;
+    let shown = ease(ui, "ring", score as f32);
+    let litf = shown / 100.0 * n as f32;
+    let lit = litf.floor() as usize;
     for i in 0..n {
         let a0 = -tau / 4.0 + tau * i as f32 / n as f32 + 0.02;
         let a1 = a0 + tau / n as f32 - 0.05;
@@ -624,18 +707,30 @@ fn ring(ui: &mut Ui, score: u8, size: f32) {
         if i < lit {
             p.add(Shape::line(pts.clone(), Stroke::new(14.0, col.gamma_multiply(0.15))));
             p.add(Shape::line(pts, Stroke::new(8.0, col)));
+        } else if i == lit && litf > lit as f32 {
+            p.add(Shape::line(pts, Stroke::new(8.0, col.gamma_multiply(0.25 + 0.75 * (litf - lit as f32)))));
         } else {
             p.add(Shape::line(pts, Stroke::new(8.0, LINE)));
         }
     }
     let pulse = 0.75 + 0.25 * (t * 2.0).sin();
     p.circle_filled(c, size * 0.24, col.gamma_multiply(0.06 * pulse));
-    p.text(c - Vec2::new(0.0, 8.0), Align2::CENTER_CENTER, score.to_string(), display(size * 0.22), TEXT);
+    p.text(c - Vec2::new(0.0, 8.0), Align2::CENTER_CENTER, format!("{:.0}", shown), display(size * 0.22), TEXT);
     p.text(c + Vec2::new(0.0, size * 0.13), Align2::CENTER_CENTER, "INTEGRITY", mono(11.0), col);
 }
 
 /// Neon line chart with grid and hover readout. `max` None = auto.
+/// A live chart that glides between samples (newest point slides in from the right edge).
+fn live_chart(ui: &mut Ui, vals: &[f32], max: Option<f32>, color: Color32, height: f32) {
+    let phase = ui.ctx().data(|d| d.get_temp::<f32>(phase_id())).unwrap_or(1.0);
+    chart_impl(ui, vals, max, color, height, Some(phase));
+}
+
 fn chart(ui: &mut Ui, vals: &[f32], max: Option<f32>, color: Color32, height: f32) {
+    chart_impl(ui, vals, max, color, height, None);
+}
+
+fn chart_impl(ui: &mut Ui, vals: &[f32], max: Option<f32>, color: Color32, height: f32, phase: Option<f32>) {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, height), Sense::hover());
     let p = ui.painter_at(rect.expand(2.0));
@@ -653,16 +748,32 @@ fn chart(ui: &mut Ui, vals: &[f32], max: Option<f32>, color: Color32, height: f3
         p.text(rect.center(), Align2::CENTER_CENTER, "ACQUIRING SIGNAL…", mono(11.0), MUTED);
         return;
     }
-    let top = max.unwrap_or_else(|| vals.iter().cloned().fold(0.0f32, f32::max).max(1.0) * 1.15);
+    let raw_top = max.unwrap_or_else(|| vals.iter().cloned().fold(0.0f32, f32::max).max(1.0) * 1.15);
+    // auto-scaled charts ease their scale too, so the line doesn't jump when the peak changes
+    let top = if max.is_none() { ease(ui, &format!("top{:.0}x{:.0}", rect.left(), rect.top()), raw_top).max(0.001) } else { raw_top };
     let n = vals.len();
-    let pt = |i: usize, v: f32| Pos2::new(rect.left() + rect.width() * i as f32 / (n - 1) as f32, rect.bottom() - rect.height() * (v / top).clamp(0.0, 1.0));
-    let line: Vec<Pos2> = vals.iter().enumerate().map(|(i, v)| pt(i, *v)).collect();
+    let yv = |v: f32| rect.bottom() - rect.height() * (v / top).clamp(0.0, 1.0);
+    let line: Vec<Pos2> = match phase {
+        // live: draw one sample behind, with the head interpolated toward the newest value
+        Some(ph) if n >= 3 => {
+            let step = rect.width() / (n - 2) as f32;
+            let mut l: Vec<Pos2> = (0..n - 1).map(|i| Pos2::new(rect.right() - ((n - 2 - i) as f32 + ph) * step, yv(vals[i]))).collect();
+            let head = vals[n - 2] + (vals[n - 1] - vals[n - 2]) * ph;
+            l.push(Pos2::new(rect.right(), yv(head)));
+            l.retain(|p| p.x >= rect.left() - step);
+            l
+        }
+        _ => vals.iter().enumerate().map(|(i, v)| Pos2::new(rect.left() + rect.width() * i as f32 / (n - 1) as f32, yv(*v))).collect(),
+    };
+    let p = ui.painter_at(rect.expand(2.0));
+    let n = line.len();
     for i in 0..n - 1 {
         let a = line[i];
         let b = line[i + 1];
         p.add(Shape::convex_polygon(vec![a, b, Pos2::new(b.x, rect.bottom()), Pos2::new(a.x, rect.bottom())], color.gamma_multiply(0.07), Stroke::NONE));
     }
     glow_line(&p, line.clone(), color, 1.6);
+    let vals: Vec<f32> = line.iter().map(|q| (rect.bottom() - q.y) / rect.height() * top).collect();
     let last = *line.last().unwrap();
     p.circle_filled(last, 3.0, color);
     p.circle_stroke(last, 6.0, Stroke::new(1.0, color.gamma_multiply(0.5)));
@@ -678,14 +789,20 @@ fn chart(ui: &mut Ui, vals: &[f32], max: Option<f32>, color: Color32, height: f3
 
 fn stat_card(ui: &mut Ui, label: &str, value: String, sub: String, vals: &[f32], max: Option<f32>, color: Color32, change: f32, unit: &str) {
     hud_frame(ui, Some(label), color, |ui| {
+        // roll the number toward the newest sample
+        let shown = match vals.last() {
+            Some(&v) if value.ends_with('%') => format!("{:.0}%", ease(ui, label, v)),
+            Some(&v) if value.ends_with("MB/s") => format!("{:.1} MB/s", ease(ui, label, v)),
+            _ => value,
+        };
         ui.horizontal(|ui| {
-            ui.label(RichText::new(value).font(display(26.0)).color(color));
+            ui.label(RichText::new(shown).font(display(26.0)).color(color));
             ui.add_space(4.0);
             delta(ui, change, unit);
         });
         ui.label(RichText::new(sub).color(MUTED).size(14.0));
         ui.add_space(4.0);
-        chart(ui, vals, max, color, 56.0);
+        live_chart(ui, vals, max, color, 56.0);
     });
 }
 
@@ -1063,6 +1180,22 @@ impl App {
             })
             .response
             .on_hover_text("Background service: history, freeze log, automatic cleanup");
+            let (mode_txt, mode_col) = if self.smooth_now {
+                ("DISPLAY · SMOOTH 60 FPS".to_string(), ACCENT)
+            } else {
+                (format!("DISPLAY · EVERY {} S", self.cfg.view_interval.clamp(1, 60)), if self.cfg.view_mode == "auto" { WARN } else { MUTED })
+            };
+            ui.label(RichText::new(mode_txt).font(mono(10.5)).color(mode_col)).on_hover_text(if self.cfg.view_mode == "auto" {
+                "Auto: smooth while the CPU has room, slower while the PC is busy. Change it in Settings."
+            } else {
+                "Change it in Settings."
+            });
+            let upd = self.shared.lock().unwrap().update.clone();
+            if let Some(Ok(Some((tag, url)))) = upd {
+                if hud_button(ui, &format!("Update {tag}"), GOOD, false).clicked() {
+                    let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                }
+            }
         });
         ui.add_space(14.0);
         let items = [
@@ -1148,7 +1281,8 @@ impl App {
         });
         ui.add_space(10.0);
 
-        let series = |g: &dyn Fn(&Snapshot) -> f32| ring_v.iter().map(|s| g(s)).collect::<Vec<f32>>();
+        // stat cards show the last 90 s so the glide between samples is visible
+        let series = |g: &dyn Fn(&Snapshot) -> f32| ring_v[ring_v.len().saturating_sub(90)..].iter().map(|s| g(s)).collect::<Vec<f32>>();
         let prev = ring_v.get(ring_v.len().saturating_sub(11)).cloned().unwrap_or_default();
         let dmb = |s: &Snapshot| s.main_disk().map(|d| d.read_mbs + d.write_mbs).unwrap_or(0.0);
         // movers board refresh every 3 s
@@ -1229,7 +1363,7 @@ impl App {
                 "Disk speed",
                 format!("{:.1} MB/s", disk.read_mbs + disk.write_mbs),
                 format!("{:.0}% busy · {:.1} ms latency", disk.util_pct, disk.await_ms),
-                &series(&|s| s.main_disk().map(|d| d.await_ms).unwrap_or(0.0)),
+                &series(&|s| dmb(s)),
                 None,
                 BLUE,
                 dmb(now) - dmb(&prev),
@@ -1238,7 +1372,7 @@ impl App {
         });
         // trading-board row: core matrix, CPU candles, top movers
         ui.add_space(8.0);
-        let cpu_series = series(&|s| s.cpu_pct);
+        let cpu_series: Vec<f32> = ring_v.iter().map(|s| s.cpu_pct).collect();
         let movers = self.movers.clone();
         let t = ui.input(|i| i.time) as f32;
         ui.columns(3, |c| {
@@ -1281,7 +1415,16 @@ impl App {
                     (Act::Clean("journal".into()), ACCENT),
                     (Act::Clean("browser".into()), ACCENT),
                     (Act::Clean("docker-unused".into()), ACCENT),
+                    (Act::Clean("zram".into()), VIOLET),
+                    (Act::Clean("ssd-tune".into()), VIOLET),
+                    (Act::Clean("tracker".into()), VIOLET),
                 ] {
+                    // tunes that are already applied disappear from the list
+                    if matches!(&a, Act::Clean(id) if ["zram", "ssd-tune", "tracker"].contains(&id.as_str()))
+                        && self.shared.lock().unwrap().rules.as_ref().map(|r| !r.iter().any(|x| matches!(&a, Act::Clean(id) if x.id == id))).unwrap_or(false)
+                    {
+                        continue;
+                    }
                     if act_button(ui, &a, col) {
                         act = Some(a);
                     }
@@ -1427,7 +1570,7 @@ impl App {
                     c[2].label(RichText::new("read · write").color(MUTED).size(12.0));
                 });
                 let vals: Vec<f32> = ring_v.iter().filter_map(|s| s.disks.iter().find(|x| x.name == d.name).map(|x| x.util_pct)).collect();
-                chart(ui, &vals, Some(100.0), BLUE, 60.0);
+                live_chart(ui, &vals, Some(100.0), BLUE, 60.0);
             });
             ui.add_space(8.0);
         }
@@ -1760,9 +1903,41 @@ impl App {
                 }
             });
         });
+        section(ui, "Display");
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                changed |= ui.radio_value(&mut self.cfg.view_mode, "auto".to_string(), "Auto").changed();
+                changed |= ui.radio_value(&mut self.cfg.view_mode, "smooth".to_string(), "Smooth").changed();
+                changed |= ui.radio_value(&mut self.cfg.view_mode, "interval".to_string(), "Interval").changed();
+            });
+            let help = match self.cfg.view_mode.as_str() {
+                "smooth" => "Always 60 fps with live animations. Uses the most CPU.",
+                "interval" => "Refreshes only at the interval below, no animation. Lightest on a busy PC.",
+                _ => "Smooth while the CPU has room; when the PC is busy (CPU over 60%), it refreshes only at the interval below.",
+            };
+            ui.label(RichText::new(help).color(MUTED));
+            ui.horizontal(|ui| {
+                ui.label("Refresh every");
+                egui::ComboBox::from_id_salt("interval").selected_text(format!("{} s", self.cfg.view_interval)).show_ui(ui, |ui| {
+                    for v in [1u64, 2, 5, 10, 15, 30, 60] {
+                        changed |= ui.selectable_value(&mut self.cfg.view_interval, v, format!("{v} s")).changed();
+                    }
+                });
+                ui.label(RichText::new(if self.smooth_now { "· now smooth" } else { "· now on interval" }).color(MUTED));
+            });
+        });
+        section(ui, "Guards");
+        card(ui, |ui| {
+            changed |= ui.checkbox(&mut self.cfg.heat_guard, "Heat guard: switch to the power-saver profile while the CPU stays above 88 °C, and back below 75 °C").changed();
+            changed |= ui.checkbox(&mut self.cfg.memory_warn, "Warn me before memory runs out").changed();
+            changed |= ui.checkbox(&mut self.cfg.memory_kill, "When RAM and swap are both nearly gone, close the biggest app to prevent a freeze").changed();
+            ui.label(RichText::new("It asks the app to close, then forces it after 6 s. Desktop parts (GNOME Shell, Xorg, sound) are never touched.").color(MUTED).size(13.0));
+            changed |= ui.checkbox(&mut self.cfg.notify, "Desktop notifications for freezes and guard actions").changed();
+        });
         section(ui, "Automatic cleanup");
         card(ui, |ui| {
-            changed |= ui.checkbox(&mut self.cfg.auto_cleanup, "Clear the safe items on their own (thumbnails, old trash, pip cache)").changed();
+            changed |= ui.checkbox(&mut self.cfg.auto_cleanup, "Clear the safe items on their own (old thumbnails, old trash, pip cache)").changed();
+            changed |= ui.checkbox(&mut self.cfg.auto_browser, "Also clear browser caches, only while the browser is closed").changed();
             ui.horizontal(|ui| {
                 ui.label("Every");
                 changed |= ui.add(egui::Slider::new(&mut self.cfg.auto_cleanup_hours, 1..=48).suffix(" h")).changed();
@@ -1780,6 +1955,37 @@ impl App {
                 changed = true;
             }
             changed |= ui.checkbox(&mut self.cfg.auto_calm, "Calm them automatically during disk stalls").changed();
+        });
+        section(ui, "Updates");
+        card(ui, |ui| {
+            let (checking, upd) = {
+                let s = self.shared.lock().unwrap();
+                (s.update_checking, s.update.clone())
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Membli {}", env!("CARGO_PKG_VERSION"))).font(mono(14.0)));
+                if checking {
+                    ui.spinner();
+                } else if ghost(ui, "Check now").clicked() {
+                    self.check_updates();
+                }
+                match &upd {
+                    Some(Ok(Some((tag, url)))) => {
+                        ui.label(RichText::new(format!("{tag} is available")).color(GOOD));
+                        if primary(ui, "Download").clicked() {
+                            let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+                        }
+                    }
+                    Some(Ok(None)) => {
+                        ui.label(RichText::new("You have the newest version").color(MUTED));
+                    }
+                    Some(Err(e)) => {
+                        ui.label(RichText::new(e).color(WARN));
+                    }
+                    None => {}
+                }
+            });
+            changed |= ui.checkbox(&mut self.cfg.check_updates, "Check for updates when Membli opens").changed();
         });
         section(ui, "Claude");
         card(ui, |ui| {
@@ -1953,11 +2159,29 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         // smooth animation while you look at it, almost nothing in the background
         let focused = ui.input(|i| i.focused);
-        ctx.request_repaint_after(Duration::from_millis(if focused { 70 } else { 1000 }));
-        let (now_arc, ring_v) = {
+        // display mode: smooth (60 fps), interval (every N s), or auto (smooth while the CPU has room)
+        let busy = {
             let l = self.live.lock().unwrap();
-            (l.now.clone(), l.ring.iter().cloned().collect::<Vec<_>>())
+            l.now.cpu_pct > 60.0 || l.now.psi_cpu.some10 > 25.0
         };
+        let interval = self.cfg.view_interval.clamp(1, 60);
+        self.smooth_now = match self.cfg.view_mode.as_str() {
+            "smooth" => true,
+            "interval" => false,
+            _ => !busy,
+        };
+        let sample = if self.smooth_now { 1000 } else { interval * 1000 };
+        self.sample_ms.store(sample, std::sync::atomic::Ordering::Relaxed);
+        let frame_ms = if !focused { 1000.max(sample) } else if self.smooth_now { 16 } else { sample };
+        ctx.request_repaint_after(Duration::from_millis(frame_ms));
+        let (now_arc, ring_arc, at) = {
+            let l = self.live.lock().unwrap();
+            (l.now.clone(), l.shared_ring.clone(), l.at)
+        };
+        let ring_v: &[Snapshot] = &ring_arc;
+        // how far we are between two samples: charts glide by this much
+        let phase = if self.smooth_now { at.map(|t| (t.elapsed().as_secs_f32() / 1.0).min(1.0)).unwrap_or(1.0) } else { 1.0 };
+        ctx.data_mut(|d| d.insert_temp(phase_id(), phase));
         let now: &Snapshot = &now_arc;
         // claude reply arrived
         let reply = self.shared.lock().unwrap().claude_reply.take();
@@ -1997,8 +2221,8 @@ impl eframe::App for App {
                 Page::Processes => self.processes(ui, now),
                 p => {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match p {
-                        Page::Overview => self.overview(ui, now, &ring_v),
-                        Page::Disk => self.disk_page(ui, now, &ring_v),
+                        Page::Overview => self.overview(ui, now, ring_v),
+                        Page::Disk => self.disk_page(ui, now, ring_v),
                         Page::Cleanup => self.cleanup_page(ui),
                         Page::History => self.history(ui),
                         Page::Settings => self.settings(ui),
@@ -2062,6 +2286,12 @@ impl eframe::App for App {
             }
         }
         resize_edges(ui);
+        if let Some(at) = ctx.data(|d| d.get_temp::<Instant>(copied_id())) {
+            ctx.data_mut(|d| d.remove::<Instant>(copied_id()));
+            if at.elapsed() < Duration::from_secs(2) {
+                self.toast("Copied to clipboard");
+            }
+        }
         // toast
         if let Some((msg, at)) = &self.toast {
             if at.elapsed() > Duration::from_secs(4) {
@@ -2080,7 +2310,7 @@ impl eframe::App for App {
 
 pub fn run() -> anyhow::Result<()> {
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Membli").with_app_id("membli").with_decorations(false).with_resizable(true).with_inner_size([1280.0, 840.0]).with_min_inner_size([960.0, 640.0]),
+        viewport: egui::ViewportBuilder::default().with_title("Membli").with_app_id("membli").with_icon(egui::IconData { rgba: include_bytes!("../assets/icon/membli-256.rgba").to_vec(), width: 256, height: 256 }).with_decorations(false).with_resizable(true).with_inner_size([1280.0, 840.0]).with_min_inner_size([960.0, 640.0]),
         ..Default::default()
     };
     eframe::run_native("Membli", opts, Box::new(|cc| Ok(Box::new(App::new(cc))))).map_err(|e| anyhow::anyhow!("{e}"))

@@ -28,7 +28,8 @@ Membli is one binary with two modes: the **window** (`membli`) and the **backgro
 | `src/diagnose.rs` | turns a snapshot into `Finding`s (level, title, detail, fix) with `Act`ions, and the integrity score |
 | `src/cleanup.rs` | the cleanup rules: scan sizes, run one rule, the Safe auto-run, and the home space map |
 | `src/store.rs` | SQLite: `samples` (10 s rows), `events`, `cleanup_log`, `kv`; 30-day retention |
-| `src/daemon.rs` | the service loop, freeze detection, calm list, timed cleanup, `calm()` and `install_service()` |
+| `src/daemon.rs` | the service loop, freeze detection, heat and memory guards, oomd watch, notifications, calm list, timed cleanup, `calm()` and `install_service()` |
+| `src/update.rs` | checks GitHub releases for a newer version |
 | `src/claude.rs` | builds the plain-text report, journal talkers, asks Claude (CLI or API), parses suggested actions |
 | `src/config.rs` | settings in `~/.config/membli/config.json` (written atomically, mode 0600) |
 | `src/gui.rs` | the window: HUD theme, title bar, sidebar telemetry, the board components and every page |
@@ -51,6 +52,32 @@ Membli is one binary with two modes: the **window** (`membli`) and the **backgro
 ## Freeze detection
 
 The service watches `io.full avg10` and `memory.full avg10`. When either crosses its threshold (25% and 10%), an incident opens. While it lasts, the service adds up each process's disk traffic and counts which processes sit in state `D`. Once the pressure stays below the threshold for 20 seconds, the incident is written as an event: *"Disk stall for 89 s (peak 62%) — Busiest: …, Stuck: …"*. Stalls shorter than 4 seconds are ignored.
+
+## Guards
+
+All run inside the service loop (every 2 s) and can be switched off in Settings → Guards.
+
+- **Heat guard**: once the hottest sensor stays at or above 88 °C for 20 s, it reads the current profile with `powerprofilesctl get`, sets `power-saver`, and remembers the old one. After 60 s at or below 75 °C it restores the old profile, but only if the profile is still `power-saver`, so a change you made yourself is respected. power-profiles-daemon allows this for the active user without a password.
+- **Memory warning**: when `MemAvailable` is under 10% and swap under 20% free, a notification names the biggest app, at most once every 5 minutes.
+- **Memory guard** (opt-in): when RAM is under 5% *and* swap is under 10% free, it picks your own process with the highest `/proc/<pid>/oom_score` (over 100 MB, never GNOME Shell, Xorg/Xwayland, sound, D-Bus or Membli), sends `SIGTERM`, and sends `SIGKILL` if it is still alive 6 s later. The dual threshold follows earlyoom; nohang's experience is that PSI alone is too noisy for this.
+- **oomd watch**: every minute it reads `journalctl -u systemd-oomd` for `Killed` lines and records them as events.
+- **Notifications** use `notify-send` and are best-effort.
+
+## Display modes
+
+The window decides each frame whether to animate:
+
+| Mode | Sampling | Repaint while focused |
+|---|---|---|
+| Smooth | every 1 s | every 16 ms (60 fps); charts glide between samples |
+| Interval | every *N* s (1–60) | every *N* s, no animation |
+| Auto | Smooth while CPU < 60% and CPU pressure < 25%, otherwise Interval | same |
+
+When the window is not focused it repaints at most once per second (or every *N* s). Numbers, bars and the integrity ring ease toward new values (`animate_value_with_time`), and the history is shared with the window as an `Arc` rebuilt once per sample, so a frame never copies it.
+
+## Copy on select
+
+A small egui plugin (`CopyOnSelect`) watches for egui's `TextSelectionSettled` output at the end of each frame and puts that text on the clipboard, then shows a "Copied" toast. Ctrl+C keeps working through egui's own label selection.
 
 ## Actions
 

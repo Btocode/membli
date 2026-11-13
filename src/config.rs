@@ -20,6 +20,22 @@ pub struct Config {
     /// Program names that get lower CPU and disk priority whenever the disk is choking
     pub calm_apps: Vec<String>,
     pub auto_calm: bool,
+    /// switch to the power-saver profile while the CPU stays hot, back when it cools
+    pub heat_guard: bool,
+    /// notify before memory runs out
+    pub memory_warn: bool,
+    /// end the biggest app (earlyoom style) when RAM and swap are both nearly gone
+    pub memory_kill: bool,
+    /// let the automatic cleanup also clear browser caches while the browser is closed
+    pub auto_browser: bool,
+    /// desktop notifications for freezes and guard actions
+    pub notify: bool,
+    /// "auto": smooth while the CPU has room, otherwise refresh every `view_interval` s;
+    /// "smooth": always 60 fps; "interval": always every `view_interval` s
+    pub view_mode: String,
+    pub view_interval: u64,
+    /// look for a newer release on GitHub when the window opens
+    pub check_updates: bool,
     pub claude_mode: ClaudeMode,
     pub api_key: String,
     pub model: String,
@@ -33,6 +49,14 @@ impl Default for Config {
             trash_days: 30,
             calm_apps: vec![],
             auto_calm: false,
+            heat_guard: true,
+            memory_warn: true,
+            memory_kill: false,
+            auto_browser: false,
+            notify: true,
+            view_mode: "auto".into(),
+            view_interval: 5,
+            check_updates: true,
             claude_mode: ClaudeMode::Cli,
             api_key: String::new(),
             model: "claude-opus-5-5".into(),
